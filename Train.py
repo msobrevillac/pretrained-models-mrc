@@ -7,7 +7,7 @@ if __name__ == "__main__":
 	args = get_args()
 	global step
 
-elif args.pretrained_model == "t5":
+if args.pretrained_model == "t5":
 	Trainer.main(args)
 else:
 	print("model does not exist!")
