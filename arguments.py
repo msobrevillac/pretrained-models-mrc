@@ -58,6 +58,8 @@ parser.add_argument(
 parser.add_argument(
   '-similarity','--similarity', type=str, default="bertscore", choices=['transformer', 'bertscore'], help='Function to measure the similarity between answer and options (transformer|bertscore)')
 
+parser.add_argument(
+  '-input-mode', '--input_mode', type=int, default=1, choices=[1,2,3,4], help="Mode as the input is formatted")
 
 def get_args():
   args = parser.parse_args()

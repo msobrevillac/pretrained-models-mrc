@@ -1,5 +1,6 @@
 from utils import set_seed, improved
 import torch
+import math
 from transformers import AdamW
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 from constants import SPECIAL_TOKENS
@@ -77,9 +78,9 @@ def evaluate_and_predict(model, loader, tokenizer, max_length, beam_size, device
 		index, element = max(enumerate(similarities), key=itemgetter(1))
 		if index == candidates_ref[1]:
 			correct += 1
-			answers.append((1, candidates_ref[0][index], hypothesis))
+			answers.append((1, candidates_ref[0][candidates_ref[1]], hypothesis, candidates_ref[0][index]))
 		else:
-			answers.append((0, candidates_ref[0][index], hypothesis))
+			answers.append((0, candidates_ref[0][candidates_ref[1]], hypothesis, candidates_ref[0][index]))
 
 	return correct/total, answers
 
@@ -154,14 +155,16 @@ def evaluate_loss(model, loader, tokenizer, device):
 
 		input_ids = input_ids.to(device, dtype = torch.long)
 		attention_mask = attention_mask.to(device, dtype = torch.long)
+		decoder_attention_mask = decoder_attention_mask.to(device, dtype=torch.long)
+		decoder_attention_mask = decoder_attention_mask[:, 1:].clone().detach()
 
 		y = decoder_input_ids.to(device, dtype = torch.long)
 		y_ids = y[:, :-1].contiguous()
 		lm_labels = y[:, 1:].clone().detach()
 		lm_labels[y[:, 1:] == tokenizer.pad_token_id] = -100
 
-		outputs = model(input_ids = ids, attention_mask = mask, \
-					decoder_input_ids=y_ids, labels=lm_labels)
+		outputs = model(input_ids = input_ids, attention_mask = attention_mask, \
+			decoder_input_ids=y_ids, decoder_attention_mask=decoder_attention_mask, labels=lm_labels)
 		loss = outputs[0]
 		total_loss += loss.item()
 		n += 1
@@ -169,7 +172,7 @@ def evaluate_loss(model, loader, tokenizer, device):
 	return total_loss / n
 
 
-def train_epoch(model, epoch, loader, tokenizer, optimizer, print_every, device):
+def train_epoch(model, epoch, loader, tokenizer, optimizer, print_every, device, accumulation_steps):
 	'''
 		Function description
 	'''
@@ -183,6 +186,8 @@ def train_epoch(model, epoch, loader, tokenizer, optimizer, print_every, device)
 
 		input_ids = input_ids.to(device, dtype = torch.long)
 		attention_mask = attention_mask.to(device, dtype = torch.long)
+		decoder_attention_mask = decoder_attention_mask.to(device, dtype = torch.long)
+		decoder_attention_mask = decoder_attention_mask[:, 1:].clone().detach()
 
 		y = decoder_input_ids.to(device, dtype = torch.long)
 		y_ids = y[:, :-1].contiguous()
@@ -190,9 +195,10 @@ def train_epoch(model, epoch, loader, tokenizer, optimizer, print_every, device)
 		lm_labels[y[:, 1:] == tokenizer.pad_token_id] = -100
 
 		outputs = model(input_ids = input_ids, attention_mask = attention_mask, \
-                    decoder_input_ids=y_ids, labels=lm_labels) #use_cache=False for MT5
+                    decoder_input_ids=y_ids, decoder_attention_mask=decoder_attention_mask, labels=lm_labels)
 
 		loss = outputs[0]
+		loss = loss / accumulation_steps
 		total_loss += loss.item()
 		n += 1
         
@@ -202,8 +208,11 @@ def train_epoch(model, epoch, loader, tokenizer, optimizer, print_every, device)
 			total_loss = 0
 
 		loss.backward(retain_graph=False)
-		optimizer.step()
-		optimizer.zero_grad()
+		if (index+1) % accumulation_steps == 0:
+			optimizer.step()
+			optimizer.zero_grad()
+	optimizer.step()
+	optimizer.zero_grad()
 
 
 def main(args):
@@ -220,11 +229,11 @@ def main(args):
 	test_dataset = load_dataset('quail', split='challenge')
 
 	train_loader = get_dataloader(train_dataset, tokenizer, batch_size=args.batch_size, shuffle=True, \
-						max_input = args.max_input, max_output = args.max_output)
+					mode = args.input_mode, max_input = args.max_input, max_output = args.max_output)
 	dev_loader = get_dataloader(dev_dataset, tokenizer, batch_size=args.batch_size, shuffle=False, \
-						max_input = args.max_input, max_output = args.max_output)
+					mode = args.input_mode, max_input = args.max_input, max_output = args.max_output)
 	test_loader = get_dataloader(test_dataset, tokenizer, batch_size=args.batch_size, shuffle=False, \
-						max_input = args.max_input, max_output = args.max_output)
+					mode = args.input_mode, max_input = args.max_input, max_output = args.max_output)
 
 
 	model = T5ForConditionalGeneration.from_pretrained(args.model)
@@ -246,6 +255,7 @@ def main(args):
 	#if args.optimizer == "adam":
 	optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=args.adam_epsilon)
 
+	scorer = None
 	if args.early_stopping_criteria == "perplexity":
 		best_metric = float('inf')
 	elif args.early_stopping_criteria == "bertscore":
@@ -264,15 +274,15 @@ def main(args):
 			print("The training will stop because it reaches the limit of patience")
 			break
 
-		train_epoch(model, epoch, train_loader, tokenizer, optimizer, args.print_every, device)
+		train_epoch(model, epoch, train_loader, tokenizer, optimizer, args.print_every, device, 8)
 
 		if args.early_stopping_criteria == "perplexity":
 			loss = evaluate_loss(model, dev_loader, tokenizer, device)
 			validation_metric = round(math.exp(loss), 3)
 		elif args.early_stopping_criteria == "bertscore":
-			validation_metric = evaluate_bs_accuracy(model, dev_loader, tokenizer, args.max_output, args.beam_size, device, dev_dataset, scorer):
+			validation_metric = evaluate_bs_accuracy(model, dev_loader, tokenizer, args.max_output, args.beam_size, device, dev_dataset, scorer)
 		elif args.early_stopping_criteria == "transformer":
-			validation_metric = evaluate_bleu(model, dev_loader, tokenizer, args.max_output, args.beam_size, device, dev_dataset, scorer)
+			validation_metric = evaluate_tr_accuracy(model, dev_loader, tokenizer, args.max_output, args.beam_size, device, dev_dataset, scorer)
 		#else:
 		#	validation_metric = evaluate_bleu(model, dev_loader, tokenizer, args.max_length, args.beam_size, device, dev_dataset)
 
@@ -291,14 +301,16 @@ def main(args):
 			patience -= 1
 			print(f'Patience ({patience}/{args.early_stopping_patience})')
 
-	del model
+	if model is not None:
+		del model
+
 	print("Loading best checkpoint ...")
 	model = T5ForConditionalGeneration.from_pretrained(args.save_dir)#
 	model.to(device)
 	print("Model was loaded sucessfully.")
 
-
-	del scorer
+	if scorer is not None:
+		del scorer
 
 	if args.similarity == "bertscore":
 		similarity_method = BERTScorer(lang="en", device=device, batch_size=8)
@@ -308,18 +320,22 @@ def main(args):
 
 	acc, results = evaluate_and_predict(model, dev_loader, tokenizer, args.max_output, args.beam_size, device, \
 							dev_dataset, scorer=similarity_method)
+	print("Accuracy on dev\t", str(acc))
 	with open(args.save_dir + "/dev.out", "w") as f:
 		f.write(str(acc) + "\n")
+		f.write("Result\tAnswer\tGenerated\tMatched\n")
 		for result in results:
-			f.write(str(result[0]) + "\t" + result[1] + "\t" + result[2] + "\n")
+			f.write(str(result[0]) + "\t" + result[1] + "\t" + result[2] + "\t" + result[3] + "\n")
 
 
 	acc, results = evaluate_and_predict(model, test_loader, tokenizer, args.max_output, args.beam_size, device, \
 							test_dataset, scorer=similarity_method)
+	print("Accuracy on test\t", str(acc))
 	with open(args.save_dir + "/test.out", "w") as f:
 		f.write(str(acc) + "\n")
+		f.write("Result\tAnswer\tGenerated\tMatched\n")
 		for result in results:
-			f.write(str(result[0]) + "\t" + result[1] + "\t" + result[2] + "\n")
+			f.write(str(result[0]) + "\t" + result[1] + "\t" + result[2] + "\t" + result[3] + "\n")
 
 
 	
